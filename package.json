@@ -1,0 +1,43 @@
+{
+    "name": "wiseia-v2-backend"
+,
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "dev": "tsx watch src/index.ts",
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "test:sftp": "tsx src/routes/storage/sftp-smoke.ts"
+    },
+    "dependencies": {
+        "@fastify/cors": "^8.5.0",
+        "@fastify/multipart": "^8.3.1",
+        "@fastify/rate-limit": "^8.0.0",
+        "@fastify/sensible": "^5.6.0",
+        "@google/generative-ai": "^0.24.1",
+        "bcryptjs": "^2.4.3",
+        "csv-parser": "^3.2.0",
+        "dotenv": "^16.4.5",
+        "fastify": "^4.28.1",
+        "fastify-plugin": "^4.5.1",
+        "jsonwebtoken": "^9.0.2",
+        "knex": "^3.1.0",
+        "mammoth": "^1.11.0",
+        "mime-types": "^2.1.35",
+        "mssql": "^10.0.2",
+        "openai": "^6.7.0",
+        "ssh2-sftp-client": "^10.0.3",
+        "xlsx": "^0.18.5",
+        "zod": "^3.23.8"
+    },
+    "devDependencies": {
+        "@types/bcryptjs": "^2.4.2",
+        "@types/jsonwebtoken": "^9.0.6",
+        "@types/mime-types": "^3.0.1",
+        "@types/node": "^20.14.12",
+        "ts-node-dev": "^2.0.0",
+        "tsx": "^4.20.5",
+        "typescript": "^5.5.4"
+    }
+}
