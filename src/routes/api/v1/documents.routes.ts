@@ -5,6 +5,189 @@ import multipart from '@fastify/multipart';
 import fs from 'fs/promises';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import { createRequire } from 'module';
+
+// Document processing dependencies
+const require = createRequire(import.meta.url);
+const pdfParse = require('pdf-parse');  // CommonJS module
+import mammoth from 'mammoth';
+import * as XLSX from 'xlsx';
+
+// ===== HELPER FUNCTIONS FOR DOCUMENT PROCESSING =====
+
+/**
+ * Chunk text intelligently for RAG
+ */
+function chunkText(text: string, targetSize: number = 800, overlap: number = 100): Array<{ text: string, index: number, characterCount: number }> {
+    if (!text || text.trim().length === 0) return [];
+
+    const chunks: Array<{ text: string, index: number, characterCount: number }> = [];
+    const paragraphs = text.split(/\n\n+/).filter(p => p.trim().length > 0);
+
+    let currentChunk = '';
+    let chunkIndex = 0;
+    let previousChunkEnd = '';
+
+    for (const paragraph of paragraphs) {
+        const trimmedParagraph = paragraph.trim();
+
+        if (currentChunk.length > 0 && (currentChunk.length + trimmedParagraph.length) > targetSize) {
+            const finalChunk = previousChunkEnd + currentChunk;
+            chunks.push({
+                text: finalChunk.trim(),
+                index: chunkIndex++,
+                characterCount: finalChunk.length
+            });
+            previousChunkEnd = currentChunk.slice(-overlap);
+            currentChunk = trimmedParagraph + '\n\n';
+        } else {
+            currentChunk += trimmedParagraph + '\n\n';
+        }
+    }
+
+    if (currentChunk.trim().length > 0) {
+        const finalChunk = previousChunkEnd + currentChunk;
+        chunks.push({
+            text: finalChunk.trim(),
+            index: chunkIndex++,
+            characterCount: finalChunk.length
+        });
+    }
+
+    return chunks;
+}
+
+/**
+ * Extract text from different file types
+ */
+async function extractTextFromFile(filePath: string, fileType: string): Promise<{ text: string, metadata?: any }> {
+    const normalizedType = fileType.toLowerCase();
+
+    switch (normalizedType) {
+        case '.txt':
+            const txtBuffer = await fs.readFile(filePath);
+            return { text: txtBuffer.toString('utf-8') };
+
+        case '.csv':
+            const csvContent = await fs.readFile(filePath, 'utf-8');
+            const lines = csvContent.split('\n');
+            const formattedLines = lines.map((line, index) =>
+                index === 0 ? `Headers: ${line}` : `Row ${index}: ${line}`
+            );
+            return { text: formattedLines.join('\n') };
+
+        case '.pdf':
+            const pdfBuffer = await fs.readFile(filePath);
+            const pdfData = await pdfParse(pdfBuffer);
+            return {
+                text: pdfData.text,
+                metadata: { pageCount: pdfData.numpages }
+            };
+
+        case '.docx':
+            const docxBuffer = await fs.readFile(filePath);
+            const docxResult = await mammoth.extractRawText({ buffer: docxBuffer });
+            return { text: docxResult.value };
+
+        case '.xlsx':
+        case '.xls':
+            const workbook = XLSX.readFile(filePath);
+            let allText = '';
+            for (const sheetName of workbook.SheetNames) {
+                const sheet = workbook.Sheets[sheetName];
+                const sheetData = XLSX.utils.sheet_to_csv(sheet);
+                allText += `\n=== Sheet: ${sheetName} ===\n${sheetData}\n`;
+            }
+            return {
+                text: allText,
+                metadata: { sheetCount: workbook.SheetNames.length }
+            };
+
+        default:
+            throw new Error(`Unsupported file type: ${fileType}`);
+    }
+}
+
+/**
+ * Process document: extract text, create chunks, save to database
+ */
+async function processDocumentAsync(
+    fastify: any,
+    documentId: string,
+    filePath: string,
+    fileType: string
+): Promise<void> {
+    try {
+        fastify.log.info({ documentId, fileType }, 'Starting document processing');
+
+        // Extract text
+        const { text, metadata } = await extractTextFromFile(filePath, fileType);
+
+        if (!text || text.trim().length === 0) {
+            throw new Error('No text extracted from document');
+        }
+
+        // Create chunks
+        const chunks = chunkText(text);
+
+        // Save chunks to database
+        const pool = await getPool();
+
+        for (const chunk of chunks) {
+            const chunkId = randomUUID();
+            await pool.request()
+                .input('chunkId', sql.UniqueIdentifier, chunkId)
+                .input('documentId', sql.UniqueIdentifier, documentId)
+                .input('chunkIndex', sql.Int, chunk.index)
+                .input('chunkText', sql.NVarChar(sql.MAX), chunk.text)
+                .input('tokenCount', sql.Int, Math.ceil(chunk.text.length / 4))
+                .query(`
+                    INSERT INTO DocumentChunks (
+                        ChunkID, DocumentID, ChunkIndex, ChunkText, TokenCount, CreatedAt
+                    )
+                    VALUES (
+                        @chunkId, @documentId, @chunkIndex, @chunkText, @tokenCount, GETUTCDATE()
+                    )
+                `);
+        }
+
+        // Update document status
+        await pool.request()
+            .input('documentId', sql.UniqueIdentifier, documentId)
+            .query(`
+                UPDATE Documents 
+                SET Status = 'processed', ProcessedAt = GETUTCDATE()
+                WHERE DocumentID = @documentId
+            `);
+
+        fastify.log.info({ documentId, chunksCreated: chunks.length }, 'Document processed successfully');
+
+        // TODO: Trigger proactive analysis
+        // const { analyzeDocumentOnUpload } = await import('../../../ai/proactiveAnalyzer.js');
+        // await analyzeDocumentOnUpload(documentId);
+
+    } catch (error: any) {
+        fastify.log.error({ error: error.message, documentId }, 'Document processing failed');
+
+        // Update document status to error
+        try {
+            const pool = await getPool();
+            await pool.request()
+                .input('documentId', sql.UniqueIdentifier, documentId)
+                .input('error', sql.NVarChar(sql.MAX), error.message)
+                .query(`
+                    UPDATE Documents 
+                    SET Status = 'error', ProcessingError = @error
+                    WHERE DocumentID = @documentId
+                `);
+        } catch (dbError) {
+            fastify.log.error({ dbError }, 'Failed to update error status');
+        }
+    }
+}
+
+// ===== END HELPER FUNCTIONS =====
+
 
 export const documentsApiRoutes: FastifyPluginAsync = async (fastify) => {
     // Register multipart for file uploads
@@ -171,8 +354,10 @@ VALUES(
 SELECT * FROM Documents WHERE DocumentID = @documentId;
 `);
 
-            // TODO: Process document (extract chunks, embeddings, metadata)
-            // This should be done async in background
+            // Process document asynchronously (don't block response)
+            setImmediate(async () => {
+                await processDocumentAsync(fastify, documentId, filePath, fileType);
+            });
 
             reply.status(201).send(result.recordset[0]);
         } catch (error) {
