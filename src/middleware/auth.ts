@@ -1,37 +1,41 @@
 import fp from 'fastify-plugin';
-import { FastifyPluginAsync } from 'fastify';
-import jwt from 'jsonwebtoken';
-import { db } from '../db.js';
-import { env } from '../env.js';
+import { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
+
+export interface AuthenticatedUser {
+	userId: string;
+	companyId: string;
+	email: string;
+	isAdmin: boolean;
+	cargo?: string;
+}
 
 declare module 'fastify' {
 	interface FastifyRequest {
-		user?: {
-			idUsuario: number;
-			idEmpresa: number;
-			role: string;
-			email: string;
-		}
+		user: AuthenticatedUser;
 	}
 }
 
+/**
+ * Authentication plugin that adds authenticate and requireManager decorators
+ */
 export const authPlugin: FastifyPluginAsync = fp(async (app) => {
-	app.decorate('authenticate', async (req: any, reply: any) => {
-		const h = req.headers.authorization;
-		if (!h?.startsWith('Bearer ')) {
-			return reply.code(401).send({ error: 'missing_token' });
-		}
+	// Decorator for JWT verification
+	app.decorate('authenticate', async (request: FastifyRequest, reply: FastifyReply) => {
 		try {
-			const token = h.substring(7);
-			const payload = jwt.verify(token, env.JWT_SECRET) as any;
-			req.user = {
-				idUsuario: payload.idUsuario,
-				idEmpresa: payload.idEmpresa,
-				role: payload.role,
-				email: payload.email
-			};
-		} catch {
-			return reply.code(401).send({ error: 'invalid_token' });
+			await request.jwtVerify();
+			// Token payload is now in request.user
+		} catch (err) {
+			reply.status(401).send({ error: 'Não autenticado' });
 		}
 	});
+
+	// Decorator for Manager role check
+	app.decorate('requireManager', (request: FastifyRequest, reply: FastifyReply) => {
+		const user = request.user as AuthenticatedUser;
+		if (!user.isAdmin && !user.cargo?.toLowerCase().includes('manager')) {
+			reply.status(403).send({ error: 'Apenas Managers podem executar esta ação' });
+		}
+	});
+
+	app.log.info('Auth decorators registered successfully');
 });

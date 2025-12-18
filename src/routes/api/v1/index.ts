@@ -6,6 +6,7 @@ import { alertsApiRoutes } from './alerts.routes.js';
 import { documentTypesApiRoutes } from './document-types.routes.js';
 import { aiApiRoutes } from './ai.routes.js';
 import { proactiveApiRoutes } from './proactive.routes.js';
+import { departamentosV1Routes } from './departamentos.routes.js';
 
 /**
  * API v1 Routes
@@ -19,6 +20,7 @@ export const apiV1Routes: FastifyPluginAsync = async (fastify) => {
     fastify.register(documentTypesApiRoutes);
     fastify.register(aiApiRoutes); // AI Chat + RAG
     fastify.register(proactiveApiRoutes); // Proactive Analysis
+    fastify.register(departamentosV1Routes); // Departments CRUD
 
     // Health check
     fastify.get('/health', async (request, reply) => {

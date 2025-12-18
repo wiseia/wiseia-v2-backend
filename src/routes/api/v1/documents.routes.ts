@@ -162,9 +162,19 @@ async function processDocumentAsync(
 
         fastify.log.info({ documentId, chunksCreated: chunks.length }, 'Document processed successfully');
 
-        // TODO: Trigger proactive analysis
-        // const { analyzeDocumentOnUpload } = await import('../../../ai/proactiveAnalyzer.js');
-        // await analyzeDocumentOnUpload(documentId);
+        // Trigger proactive analysis automatically
+        try {
+            const { analyzeDocumentOnUpload } = await import('../../../ai/proactiveAnalyzer.js');
+
+            // TODO: Get actual companyId from document/user context
+            // For now, using a test companyId - should be retrieved from JWT or document metadata
+            const companyId = '00000000-0000-0000-0000-000000000001'; // Placeholder
+
+            await analyzeDocumentOnUpload(documentId, companyId);
+            fastify.log.info({ documentId }, 'Proactive analysis completed');
+        } catch (analysisError: any) {
+            fastify.log.error({ error: analysisError.message, documentId }, 'Proactive analysis failed');
+        }
 
     } catch (error: any) {
         fastify.log.error({ error: error.message, documentId }, 'Document processing failed');
@@ -197,11 +207,15 @@ export const documentsApiRoutes: FastifyPluginAsync = async (fastify) => {
      * GET /api/v1/documents
      * List documents with optional filters
      */
-    fastify.get('/documents', async (request, reply) => {
+    fastify.get('/documents', {
+        onRequest: [fastify.authenticate]
+    }, async (request: any, reply) => {
         try {
             const {
                 query: queryText,
                 notebookId,
+                departmentId,
+                divisionId,
                 tags,
                 dateFrom,
                 dateTo,
@@ -212,7 +226,72 @@ export const documentsApiRoutes: FastifyPluginAsync = async (fastify) => {
             const pool = await getPool();
             const sqlRequest = pool.request();
 
-            let whereConditions = ['d.Active = 1'];
+            // Get user info from JWT
+            const userRole = request.user?.role || 'user';
+            const userDepartmentId = request.user?.departmentId;
+            const userDivisionId = request.user?.divisionId;
+            const userId = request.user?.userId;
+            const userCompanyId = request.user?.companyId;
+
+            let whereConditions: string[] = ['d.Active = 1'];
+
+            // SECURITY: Permission filtering based on 5-level role system
+            if (userRole === 'superuser') {
+                // Superuser: NO ACCESS to company documents (platform admin only)
+                whereConditions.push('1 = 0'); // Block all documents
+                fastify.log.warn('Superuser attempted to access company documents');
+            } else if (userRole === 'master') {
+                // Master: See ALL documents from their company
+                whereConditions.push('d.CompanyID = @userCompanyId');
+                sqlRequest.input('userCompanyId', sql.UniqueIdentifier, userCompanyId);
+            } else if (userRole === 'manager') {
+                // Manager: Only documents from their department + company
+                whereConditions.push('d.CompanyID = @userCompanyId');
+                whereConditions.push(`EXISTS (
+                    SELECT 1 FROM DocumentPermissions dp
+                    WHERE dp.DocumentID = d.DocumentID
+                    AND dp.DepartmentID = @userDepartmentId
+                )`);
+                sqlRequest.input('userCompanyId', sql.UniqueIdentifier, userCompanyId);
+                sqlRequest.input('userDepartmentId', sql.UniqueIdentifier, userDepartmentId);
+            } else if (userRole === 'coordinator') {
+                // Coordinator: Only documents from their division + company
+                whereConditions.push('d.CompanyID = @userCompanyId');
+                whereConditions.push(`EXISTS (
+                    SELECT 1 FROM DocumentPermissions dp
+                    WHERE dp.DocumentID = d.DocumentID
+                    AND dp.DivisionID = @userDivisionId
+                )`);
+                sqlRequest.input('userCompanyId', sql.UniqueIdentifier, userCompanyId);
+                sqlRequest.input('userDivisionId', sql.UniqueIdentifier, userDivisionId);
+            } else {
+                // User: ONLY their own documents + company
+                whereConditions.push('d.CompanyID = @userCompanyId');
+                whereConditions.push(`EXISTS (
+                    SELECT 1 FROM DocumentPermissions dp
+                    WHERE dp.DocumentID = d.DocumentID
+                    AND dp.UserID = @userId
+                )`);
+                sqlRequest.input('userCompanyId', sql.UniqueIdentifier, userCompanyId);
+                sqlRequest.input('userId', sql.UniqueIdentifier, userId);
+            }
+
+            // Frontend filters (additional filtering on top of role permissions)
+            if (departmentId) {
+                whereConditions.push(`EXISTS (
+                    SELECT 1 FROM DocumentPermissions dp2
+                    WHERE dp2.DocumentID = d.DocumentID AND dp2.DepartmentID = @departmentId
+                )`);
+                sqlRequest.input('departmentId', sql.UniqueIdentifier, departmentId);
+            }
+
+            if (divisionId) {
+                whereConditions.push(`EXISTS (
+                    SELECT 1 FROM DocumentPermissions dp3
+                    WHERE dp3.DocumentID = d.DocumentID AND dp3.DivisionID = @divisionId
+                )`);
+                sqlRequest.input('divisionId', sql.UniqueIdentifier, divisionId);
+            }
 
             if (notebookId) {
                 whereConditions.push('d.NotebookID = @notebookId');
@@ -233,30 +312,57 @@ export const documentsApiRoutes: FastifyPluginAsync = async (fastify) => {
                 ? 'WHERE ' + whereConditions.join(' AND ')
                 : '';
 
-            const queryString = `
-SELECT
-d.DocumentID as id,
-    d.Title as title,
-    d.FileName as fileName,
-    d.FileType as fileType,
-    d.FileSize as fileSize,
-    d.NotebookID as notebookId,
-    d.Status as status,
-    d.CreatedAt as uploadedAt,
-    d.CreatedBy as uploadedBy,
-    u.FullName as uploadedByName
-        FROM Documents d
-        LEFT JOIN Users u ON d.CreatedBy = u.UserID
-        ${whereClause}
-        ORDER BY d.CreatedAt DESC
-        OFFSET @offset ROWS
-        FETCH NEXT @limit ROWS ONLY
-    `;
+            // Declare limit and offset BEFORE using in query
+            sqlRequest.input('limit', sql.Int, parseInt(limit));
+            sqlRequest.input('offset', sql.Int, parseInt(offset));
 
-            sqlRequest.input('limit', sql.Int, limit);
-            sqlRequest.input('offset', sql.Int, offset);
+            const queryString = `
+                SELECT
+                    d.DocumentID as idDocumento,
+                    d.Title as titulo,
+                    d.FileName as nomeOriginal,
+                    d.FileType as mime,
+                    d.FileSize as tamanhoBytes,
+                    d.NotebookID as notebookId,
+                    d.Status as status,
+                    d.CreatedAt as criadoEmUtc,
+                    d.CreatedBy as uploadedBy,
+                    u.FullName as uploadedByNome,
+                    d.Active as isAtivo,
+                    (
+                        SELECT STRING_AGG(dept.Name, ', ')
+                        FROM DocumentPermissions dp
+                        INNER JOIN Departments dept ON dp.DepartmentID = dept.DepartmentID
+                        WHERE dp.DocumentID = d.DocumentID
+                    ) AS departamentoNome,
+                    (
+                        SELECT STRING_AGG(div.Name, ', ')
+                        FROM DocumentPermissions dp
+                        INNER JOIN Divisions div ON dp.DivisionID = div.DivisionID
+                        WHERE dp.DocumentID = d.DocumentID
+                    ) AS divisions
+                FROM Documents d
+                LEFT JOIN Users u ON d.CreatedBy = u.UserID
+                ${whereClause}
+                ORDER BY d.CreatedAt DESC
+                OFFSET @offset ROWS
+                FETCH NEXT @limit ROWS ONLY
+            `;
+
+            // DEBUG: Log query details
+            fastify.log.info({
+                userRole,
+                userDepartmentId,
+                userCompanyId,
+                whereClause,
+                queryString: queryString.substring(0, 200) + '...'
+            }, '🔍 GET /documents query');
 
             const result = await sqlRequest.query(queryString);
+
+            fastify.log.info({
+                recordCount: result.recordset.length
+            }, '📊 GET /documents result');
 
             reply.send(result.recordset);
         } catch (error) {
@@ -301,7 +407,9 @@ d.*,
      * POST /api/v1/documents
      * Upload new document
      */
-    fastify.post('/documents', async (request, reply) => {
+    fastify.post('/documents', {
+        onRequest: [fastify.authenticate]
+    }, async (request, reply) => {
         try {
             const data = await request.file();
 
@@ -328,8 +436,37 @@ d.*,
             const tagsStr = fields.tags?.value;
             const extractMetadata = fields.extractMetadata?.value === 'true';
 
+            // NEW: Get departments and divisions for permissions
+            const departmentIdsStr = fields.departmentIds?.value; // JSON array
+            const divisionIdsStr = fields.divisionIds?.value;     // JSON array
+
+            // DEBUG: Log what we received
+            fastify.log.info({
+                fieldsKeys: Object.keys(fields),
+                departmentIdsStr,
+                divisionIdsStr
+            }, '🔍 Multipart fields received');
+
             // Insert into database
             const pool = await getPool();
+
+            // Get user info from JWT
+            const createdBy = (request as any).user?.userId;
+            const companyId = (request as any).user?.companyId;
+
+            // DEBUG: Log JWT contents
+            fastify.log.info({
+                hasUser: !!(request as any).user,
+                userKeys: (request as any).user ? Object.keys((request as any).user) : [],
+                createdBy,
+                companyId
+            }, '🔑 JWT User Data');
+
+            if (!companyId) {
+                fastify.log.error({ jwtUser: (request as any).user }, '❌ CompanyID NOT FOUND in JWT');
+                return reply.status(400).send({ error: 'CompanyID not found in session' });
+            }
+
             const result = await pool
                 .request()
                 .input('documentId', sql.UniqueIdentifier, documentId)
@@ -339,20 +476,86 @@ d.*,
                 .input('filePath', sql.NVarChar(512), filePath)
                 .input('title', sql.NVarChar(500), fileName)
                 .input('notebookId', sql.UniqueIdentifier, notebookId || null)
+                .input('companyId', sql.UniqueIdentifier, companyId)
                 .input('status', sql.NVarChar(50), 'processing')
-                .input('createdBy', sql.UniqueIdentifier, null) // TODO: Get from JWT
+                .input('createdBy', sql.UniqueIdentifier, createdBy || null)
                 .query(`
           INSERT INTO Documents(
         DocumentID, FileName, FileType, FileSize, FilePath,
-        Title, NotebookID, Status, CreatedBy
+        Title, NotebookID, CompanyID, Status, CreatedBy, CreatedAt, Active
     )
 VALUES(
     @documentId, @fileName, @fileType, @fileSize, @filePath,
-    @title, @notebookId, @status, @createdBy
+    @title, @notebookId, @companyId, @status, @createdBy, GETUTCDATE(), 1
 );
 
 SELECT * FROM Documents WHERE DocumentID = @documentId;
 `);
+
+            // Save document permissions (departments + divisions)
+            const departmentIds = departmentIdsStr ? JSON.parse(departmentIdsStr) : [];
+            const divisionIds = divisionIdsStr ? JSON.parse(divisionIdsStr) : [];
+
+            //  Validate: At least one department must be selected
+            if (departmentIds.length === 0) {
+                fastify.log.warn({ departmentIdsStr, parsedLength: departmentIds.length }, '⚠️ No departments - validation failed');
+                return reply.status(400).send({
+                    error: 'Pelo menos um departamento deve ser selecionado'
+                });
+            }
+
+            // Get division -> department mapping
+            const divisionDeptMap = new Map<string, string>();
+            if (divisionIds.length > 0) {
+                const divResult = await pool.request()
+                    .input('divisionIds', sql.NVarChar(sql.MAX), JSON.stringify(divisionIds))
+                    .query(`
+                        SELECT DivisionID, DepartmentID 
+                        FROM Divisions 
+                        WHERE DivisionID IN (SELECT value FROM OPENJSON(@divisionIds))
+                    `);
+
+                for (const row of divResult.recordset) {
+                    divisionDeptMap.set(row.DivisionID, row.DepartmentID);
+                }
+            }
+
+            // Save permissions: departments with their divisions
+            for (const deptId of departmentIds) {
+                // Find divisions belonging to this department
+                const deptDivisions = divisionIds.filter(divId => divisionDeptMap.get(divId) === deptId);
+
+                if (deptDivisions.length > 0) {
+                    // Save one row per division in this department
+                    for (const divId of deptDivisions) {
+                        await pool.request()
+                            .input('documentId', sql.UniqueIdentifier, documentId)
+                            .input('departmentId', sql.UniqueIdentifier, deptId)
+                            .input('divisionId', sql.UniqueIdentifier, divId)
+                            .input('createdBy', sql.UniqueIdentifier, createdBy || null)
+                            .query(`
+                                INSERT INTO DocumentPermissions (DocumentID, DepartmentID, DivisionID, AccessLevel, CreatedBy)
+                                VALUES (@documentId, @departmentId, @divisionId, 'read', @createdBy)
+                            `);
+                    }
+                } else {
+                    // Department-level permission (all divisions)
+                    await pool.request()
+                        .input('documentId', sql.UniqueIdentifier, documentId)
+                        .input('departmentId', sql.UniqueIdentifier, deptId)
+                        .input('createdBy', sql.UniqueIdentifier, createdBy || null)
+                        .query(`
+                            INSERT INTO DocumentPermissions (DocumentID, DepartmentID, AccessLevel, CreatedBy)
+                            VALUES (@documentId, @departmentId, 'read', @createdBy)
+                        `);
+                }
+            }
+
+            fastify.log.info({
+                documentId,
+                departmentsCount: departmentIds.length,
+                divisionsCount: divisionIds.length
+            }, 'Document permissions saved');
 
             // Process document asynchronously (don't block response)
             setImmediate(async () => {
@@ -361,7 +564,11 @@ SELECT * FROM Documents WHERE DocumentID = @documentId;
 
             reply.status(201).send(result.recordset[0]);
         } catch (error) {
-            fastify.log.error(error);
+            fastify.log.error({
+                error,
+                errorMessage: (error as any).message,
+                errorStack: (error as any).stack
+            }, '❌ Failed to upload document');
             reply.status(500).send({ error: 'Failed to upload document' });
         }
     });

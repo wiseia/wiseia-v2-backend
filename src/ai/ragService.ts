@@ -1,186 +1,84 @@
-// src/ai/ragService.ts
-// Serviço RAG: ingestão, chunking, embeddings, busca semântica e chamada ao LLM.
+import { getPool, sql } from '../db.js';
+import { openai, OPENAI_MODEL } from '../lib/openaiClient.js';
 
-import crypto from "node:crypto";
-import OpenAI from "openai";
-import type {
-  DocumentRecord,
-  ChunkRecord,
-  SearchFilters,
-  SearchResult,
-} from "./types.js";
-import { parseBufferToText } from "./fileParser.js";
-import * as embeddingsClient from "./embeddingsClient.js";
-import * as corpusStore from "./corpusStore.js";
+// ==================== TIPOS ====================
 
-// ---------------------
-// Configuração OpenAI
-// ---------------------
+export interface RagScope {
+  companyId: string;
+  department?: string;
+  division?: string;
+  documentType?: string;
+  documentIds?: string[]; // Específicos documentos
+  tags?: string[];
+  ownerUserId?: string;
+  dateFrom?: Date;
+  dateTo?: Date;
+}
 
-const OPENAI_API_KEY =
-  process.env.OPENAI_API_KEY_V2 || process.env.OPENAI_API_KEY || "";
+export interface DocumentChunk {
+  chunkId: string;
+  documentId: string;
+  documentTitle: string;
+  chunkIndex: number;
+  text: string;
+  embedding: number[];
+  metadata: {
+    companyId: string;
+    department?: string;
+    documentType?: string;
+    tags?: string[];
+    createdAt: Date;
+  };
+}
 
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-});
+export interface RagResult {
+  answer: string;
+  sources: ChunkSource[];
+  confidence: number;
+  tokensUsed: number;
+}
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4.1-mini";
+export interface ChunkSource {
+  chunkId: string;
+  documentId: string;
+  documentTitle: string;
+  score: number;
+  text: string;
+  metadata: any;
+}
 
-// ---------------------
-// Chunking
-// ---------------------
+// ==================== CACHE ====================
 
-const DEFAULT_CHUNK_SIZE = 1000;
-const DEFAULT_CHUNK_OVERLAP = 200;
+interface CacheEntry {
+  embedding: number[];
+  timestamp: number;
+}
 
-function chunkText(
-  text: string,
-  chunkSize = DEFAULT_CHUNK_SIZE,
-  overlap = DEFAULT_CHUNK_OVERLAP
-): string[] {
-  const chunks: string[] = [];
-  if (!text) return chunks;
+const embeddingCache = new Map<string, CacheEntry>();
+const CACHE_TTL = 1000 * 60 * 60; // 1 hora
 
-  let start = 0;
-  const clean = text.replace(/\r\n/g, "\n");
-
-  while (start < clean.length) {
-    const end = Math.min(start + chunkSize, clean.length);
-    const piece = clean.slice(start, end).trim();
-    if (piece) chunks.push(piece);
-    if (end === clean.length) break;
-    start = Math.max(0, end - overlap);
+function getCachedEmbedding(text: string): number[] | null {
+  const cached = embeddingCache.get(text);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.embedding;
   }
-
-  return chunks;
+  embeddingCache.delete(text);
+  return null;
 }
 
-// ---------------------
-// Header estruturado WISEIA
-// ---------------------
-
-function buildWiseiaHeader(meta: {
-  title?: string | null;
-  departmentId?: number | null;
-  category?: string | null;
-  tags?: string[] | null;
-  companyId?: number | null;
-  divisionId?: number | null;
-}) {
-  return [
-    `TITULO: ${meta.title ?? "N/D"}`,
-    `EMPRESA_ID: ${meta.companyId ?? "N/D"}`,
-    `DEPARTAMENTO_ID: ${meta.departmentId ?? "N/D"}`,
-    `DIVISAO_ID: ${meta.divisionId ?? "N/D"}`,
-    `TIPO_DOCUMENTO: ${meta.category ?? "N/D"}`,
-    `TAGS: ${(meta.tags ?? []).join(", ") || "N/D"}`,
-    "====================================================",
-  ].join("\n");
-}
-
-// ---------------------
-// Ingestão
-// ---------------------
-
-interface IngestOptions {
-  buffer: Buffer;
-  filename: string;
-  title?: string | null;
-  departmentId?: number | null;
-  category?: string | null;
-  uploadedBy?: number | null;
-  companyId?: number | null;
-  divisionId?: number | null;
-  tags?: string[] | null;
-}
-
-export async function ingestBufferAsDocument(options: IngestOptions) {
-  const {
-    buffer,
-    filename,
-    title,
-    departmentId,
-    category,
-    uploadedBy,
-    companyId,
-    divisionId,
-    tags,
-  } = options;
-
-  const parsed = await parseBufferToText({ buffer, filename });
-
-  const docId = `doc_${crypto.randomUUID()}`;
-  const createdAt = new Date().toISOString();
-  const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
-  const docTitle = title ?? filename ?? null;
-
-  const header = buildWiseiaHeader({
-    title: docTitle,
-    departmentId,
-    category,
-    tags: tags ?? [],
-    companyId,
-    divisionId,
+function cacheEmbedding(text: string, embedding: number[]): void {
+  embeddingCache.set(text, {
+    embedding,
+    timestamp: Date.now()
   });
-
-  const fullText = `${header}\n\n${parsed.rawText || ""}`;
-
-  const texts = chunkText(fullText);
-  const embeddings =
-    texts.length > 0
-      ? await embeddingsClient.createEmbeddings(texts)
-      : ([] as number[][]);
-
-  const chunks: ChunkRecord[] = texts.map((text, i) => ({
-    chunkId: `${docId}_c${i}`,
-    docId,
-    index: i,
-    text,
-    embedding: embeddings[i] ?? null,
-    tokens: undefined,
-    createdAt,
-    metadata: {},
-  }));
-
-  const metadata = {
-    uploadedBy: uploadedBy ?? null,
-    companyId: companyId ?? null,
-    divisionId: divisionId ?? null,
-    ownerUserId: uploadedBy ?? null,
-    tags: tags ?? [],
-    docType: category ?? null,
-  };
-
-  const doc: DocumentRecord = {
-    docId,
-    title: docTitle,
-    departmentId: departmentId ?? null,
-    category: category ?? null,
-    sourceFilename: filename,
-    mime: parsed.mime,
-    sizeBytes: parsed.sizeBytes,
-    sha256,
-    rawText: parsed.rawText,
-    chunks: chunks.map((c) => c.chunkId),
-    createdAt,
-    metadata,
-  };
-
-  await corpusStore.upsertDocumentWithChunks(doc, chunks);
-
-  return { docId, chunksCreated: chunks.length };
 }
 
-// ---------------------
-// Similaridade
-// ---------------------
+// ==================== SIMILARIDADE ====================
 
 function cosineSimilarity(a: number[], b: number[]): number {
-  if (!a || !b || a.length !== b.length) return 0;
-
-  let dot = 0,
-    normA = 0,
-    normB = 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
 
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
@@ -188,169 +86,292 @@ function cosineSimilarity(a: number[], b: number[]): number {
     normB += b[i] * b[i];
   }
 
-  return !normA || !normB ? 0 : dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
 }
 
-function scoreBySubstring(chunk: string, query: string): number {
-  const q = query.toLowerCase();
-  const t = chunk.toLowerCase();
+// ==================== BUSCA DE CHUNKS ====================
 
-  if (t.includes(q)) return 1;
+async function getChunksFromDatabase(scope: RagScope): Promise<DocumentChunk[]> {
+  const pool = await getPool();
+  const request = pool.request();
 
-  const terms = q.split(/\s+/).filter(Boolean);
-  let hits = 0;
+  let whereConditions: string[] = [];
+  let params: any[] = [];
 
-  for (const term of terms) if (t.includes(term)) hits++;
+  // SEMPRE filtrar por empresa
+  whereConditions.push('d.CompanyID = @companyId');
+  request.input('companyId', sql.UniqueIdentifier, scope.companyId);
 
-  return hits === 0 ? 0 : hits / terms.length;
-}
-
-// ---------------------
-// Busca RAG
-// ---------------------
-
-export async function search(
-  query: string,
-  topK = 5,
-  filters?: SearchFilters
-): Promise<SearchResult[]> {
-  const corpus = await corpusStore.loadCorpus();
-  const allChunks = Object.values(corpus.chunks);
-
-  if (!allChunks.length) return [];
-
-  const filtered: Array<{ chunk: ChunkRecord; doc: DocumentRecord }> = [];
-
-  for (const chunk of allChunks) {
-    const doc = corpus.documents[chunk.docId];
-    if (!doc) continue;
-    const meta = doc.metadata ?? {};
-
-    if (filters?.companyId != null && meta.companyId !== filters.companyId)
-      continue;
-    if (
-      filters?.departmentId != null &&
-      doc.departmentId !== filters.departmentId
-    )
-      continue;
-    if (filters?.divisionId != null && meta.divisionId !== filters.divisionId)
-      continue;
-    if (filters?.ownerUserId != null && meta.ownerUserId !== filters.ownerUserId)
-      continue;
-
-    if (filters?.category != null) {
-      const docType = doc.category ?? meta.docType ?? "";
-      if (String(docType) !== String(filters.category)) continue;
-    }
-
-    if (filters?.tagsContains) {
-      const tags = Array.isArray(meta.tags) ? meta.tags : [];
-      const needle = String(filters.tagsContains).toLowerCase();
-      const hit = tags.some((t: string) =>
-        String(t).toLowerCase().includes(needle)
-      );
-      if (!hit) continue;
-    }
-
-    filtered.push({ chunk, doc });
+  // Filtros opcionais
+  if (scope.documentIds && scope.documentIds.length > 0) {
+    const ids = scope.documentIds.map((id, idx) => {
+      request.input(`docId${idx}`, sql.UniqueIdentifier, id);
+      return `@docId${idx}`;
+    }).join(',');
+    whereConditions.push(`d.DocumentID IN (${ids})`);
   }
 
-  if (!filtered.length) return [];
+  if (scope.department) {
+    whereConditions.push('d.Department = @department');
+    request.input('department', sql.NVarChar(100), scope.department);
+  }
 
-  const queryEmbedding = await embeddingsClient.createQueryEmbedding(query);
-  const scored: SearchResult[] = [];
+  if (scope.documentType) {
+    whereConditions.push('dt.Name = @documentType');
+    request.input('documentType', sql.NVarChar(100), scope.documentType);
+  }
 
-  for (const { chunk, doc } of filtered) {
-    const semanticScore = chunk.embedding
-      ? cosineSimilarity(queryEmbedding, chunk.embedding)
-      : 0;
+  if (scope.dateFrom) {
+    whereConditions.push('d.CreatedAt >= @dateFrom');
+    request.input('dateFrom', sql.DateTime, scope.dateFrom);
+  }
 
-    const lexicalScore = scoreBySubstring(chunk.text, query);
-    const finalScore = semanticScore * 0.75 + lexicalScore * 0.25;
+  if (scope.dateTo) {
+    whereConditions.push('d.CreatedAt <= @dateTo');
+    request.input('dateTo', sql.DateTime, scope.dateTo);
+  }
 
-    if (finalScore > 0.35) {
-      scored.push({ chunk, score: finalScore, document: doc });
+  const whereClause = whereConditions.length > 0
+    ? `WHERE ${whereConditions.join(' AND ')}`
+    : '';
+
+  const result = await request.query(`
+    SELECT 
+      c.ChunkID as chunkId,
+      c.DocumentID as documentId,
+      d.Title as documentTitle,
+      c.ChunkIndex as chunkIndex,
+      c.ChunkText as text,
+      e.Embedding as embedding,
+      d.CompanyID as companyId,
+      d.Department as department,
+      dt.Name as documentType,
+      d.Tags as tags,
+      d.CreatedAt as createdAt
+    FROM DocumentChunks c
+    INNER JOIN Documents d ON c.DocumentID = d.DocumentID
+    LEFT JOIN DocumentTypes dt ON d.TypeID = dt.TypeID
+    INNER JOIN ChunkEmbeddings e ON c.ChunkID = e.ChunkID
+    ${whereClause}
+      AND d.Active = 1
+    ORDER BY d.CreatedAt DESC
+  `);
+
+  return result.recordset.map((row: any) => ({
+    chunkId: row.chunkId,
+    documentId: row.documentId,
+    documentTitle: row.documentTitle,
+    chunkIndex: row.chunkIndex,
+    text: row.text,
+    embedding: JSON.parse(row.embedding), // Stored as JSON string
+    metadata: {
+      companyId: row.companyId,
+      department: row.department,
+      documentType: row.documentType,
+      tags: row.tags ? JSON.parse(row.tags) : [],
+      createdAt: row.createdAt
     }
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, topK);
+  }));
 }
 
-// ---------------------
-// Contexto + LLM
-// ---------------------
+// ==================== GERAÇÃO DE EMBEDDING ====================
 
-export function buildContext(
-  results: SearchResult[],
-  maxChars = 6000
-): string {
-  const parts: string[] = [];
-  let count = 0;
-
-  for (const r of results) {
-    const snippet = r.chunk.text.slice(0, 1400);
-    const header = `DOC ${r.chunk.docId} (score=${r.score.toFixed(3)}):`;
-    const block = `${header}\n${snippet}\n---`;
-
-    if (count + block.length > maxChars) break;
-
-    parts.push(block);
-    count += block.length;
+async function generateEmbedding(text: string): Promise<number[]> {
+  // Check cache first
+  const cached = getCachedEmbedding(text);
+  if (cached) {
+    console.log('[RAG] Using cached embedding');
+    return cached;
   }
 
-  return parts.join("\n");
-}
-
-export async function answerWithLLM(
-  question: string,
-  results: SearchResult[]
-): Promise<{ answer: string; context: string }> {
-  const context = buildContext(results);
-
-  const prompt = `
-Você é um assistente especialista em leitura de documentos empresariais.
-
-Extraia SEMPRE:
-• Quem é a empresa contratante
-• Quem é a empresa contratada
-• Quem representa legalmente as empresas (se aparecer)
-• Nome da pessoa física se houver "representado por", "infra-assinado" ou similar.
-
-Se houver uma pessoa física representando uma empresa:
-→ RESPONDA o nome dela explicitamente.
-
-Não responda com suposições.
-Use SOMENTE o que está no texto.
-------------------------------------
-
-CONTEXTO:
-${context}
-
-------------------------------------
-Pergunta:
-${question}
-nça".
-
----------------- CONTEXTO ----------------
-${context}
---------------- FIM CONTEXTO -------------
-
-Pergunta:
-${question}
-`.trim();
-
-  const resp = await openai.responses.create({
-    model: CHAT_MODEL,
-    input: [
-      {
-        role: "user",
-        content: [{ type: "input_text", text: prompt }],
-      },
-    ],
+  const response = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: [text]
   });
 
-  const answer = (resp as any).output_text ?? "";
+  const embedding = response.data[0].embedding;
+  cacheEmbedding(text, embedding);
 
-  return { answer, context };
+  return embedding;
+}
+
+// ==================== FUNÇÃO PRINCIPAL RAG ====================
+
+export async function askWithRag(
+  question: string,
+  scope: RagScope,
+  options: {
+    topK?: number;
+    temperature?: number;
+    includeContext?: boolean;
+  } = {}
+): Promise<RagResult> {
+  const {
+    topK = 5,
+    temperature = 0.2,
+    includeContext = true
+  } = options;
+
+  if (!question || !question.trim()) {
+    throw new Error('Pergunta vazia');
+  }
+
+  console.log(`[RAG] Pergunta: "${question}"`);
+  console.log(`[RAG] Scope: ${JSON.stringify(scope)}`);
+
+  // 1. Buscar chunks do banco de dados
+  const startFetch = Date.now();
+  const chunks = await getChunksFromDatabase(scope);
+  console.log(`[RAG] Encontrados ${chunks.length} chunks em ${Date.now() - startFetch}ms`);
+
+  if (chunks.length === 0) {
+    return {
+      answer: 'Não encontrei documentos disponíveis com os filtros aplicados. Verifique se há documentos processados para sua empresa/departamento.',
+      sources: [],
+      confidence: 0,
+      tokensUsed: 0
+    };
+  }
+
+  // 2. Gerar embedding da pergunta
+  const startEmbed = Date.now();
+  const questionEmbedding = await generateEmbedding(question);
+  console.log(`[RAG] Embedding gerado em ${Date.now() - startEmbed}ms`);
+
+  // 3. Calcular similaridade com todos os chunks
+  const startSimilarity = Date.now();
+  const scoredChunks = chunks.map(chunk => ({
+    ...chunk,
+    score: cosineSimilarity(questionEmbedding, chunk.embedding)
+  }));
+  console.log(`[RAG] Similaridade calculada em ${Date.now() - startSimilarity}ms`);
+
+  // 4. Ordenar por score e pegar top K
+  const topChunks = scoredChunks
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
+
+  console.log('[RAG] Top chunks:');
+  topChunks.forEach((chunk, idx) => {
+    console.log(`  ${idx + 1}. [${chunk.documentTitle}] score=${chunk.score.toFixed(3)}`);
+  });
+
+  // Calcular confiança média
+  const avgScore = topChunks.reduce((sum, c) => sum + c.score, 0) / topChunks.length;
+  const confidence = Math.min(avgScore * 100, 100);
+
+  // 5. Montar contexto para o GPT
+  const contextText = topChunks
+    .map((chunk, idx) =>
+      `[Trecho ${idx + 1} - Documento: "${chunk.documentTitle}" | Departamento: ${chunk.metadata.department || 'N/A'}]\n${chunk.text}`
+    )
+    .join('\n\n---\n\n');
+
+  const systemPrompt = `
+Você é a IA assistente do WISEIA, um sistema avançado de gestão de documentos corporativos.
+
+Seu objetivo é responder perguntas com base EXCLUSIVAMENTE nos trechos de documentos fornecidos.
+
+Regras importantes:
+1. Responda SEMPRE em português, de forma clara e profissional
+2. Use APENAS informações dos trechos fornecidos
+3. Se não houver informação suficiente, diga claramente
+4. Cite o documento de origem quando relevante (ex: "Segundo o documento X...")
+5. Seja objetivo e conciso, mas completo
+6. Se houver contradições entre documentos, mencione
+7. Organize a resposta em tópicos quando apropriado
+`.trim();
+
+  const userPrompt = includeContext
+    ? `
+===== CONTEXTO (Trechos de Documentos) =====
+
+${contextText}
+
+===== PERGUNTA =====
+
+${question}
+
+===== INSTRUÇÕES =====
+
+Com base APENAS nos trechos acima, responda a pergunta de forma completa e profissional.
+`.trim()
+    : question;
+
+  // 6. Chamar GPT para gerar resposta
+  const startGPT = Date.now();
+  const completion = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ],
+    temperature,
+    max_tokens: 1000
+  });
+  console.log(`[RAG] GPT respondeu em ${Date.now() - startGPT}ms`);
+
+  const answer = completion.choices[0]?.message?.content ?? 'Não foi possível gerar uma resposta.';
+  const tokensUsed = completion.usage?.total_tokens ?? 0;
+
+  return {
+    answer,
+    sources: topChunks.map(chunk => ({
+      chunkId: chunk.chunkId,
+      documentId: chunk.documentId,
+      documentTitle: chunk.documentTitle,
+      score: chunk.score,
+      text: chunk.text.substring(0, 200) + '...', // Preview
+      metadata: chunk.metadata
+    })),
+    confidence,
+    tokensUsed
+  };
+}
+
+// ==================== ANÁLISE MULTI-DOCUMENTOS ====================
+
+export async function analyzeMultipleDocuments(
+  documentIds: string[],
+  question: string,
+  companyId: string
+): Promise<RagResult> {
+  console.log(`[RAG] Análise multi-doc: ${documentIds.length} documentos`);
+
+  return await askWithRag(question, {
+    companyId,
+    documentIds
+  }, {
+    topK: documentIds.length * 3, // Mais chunks para análise comparativa
+    temperature: 0.3
+  });
+}
+
+// ==================== BUSCA SEMÂNTICA ====================
+
+export async function semanticSearch(
+  query: string,
+  scope: RagScope,
+  limit: number = 10
+): Promise<ChunkSource[]> {
+  const chunks = await getChunksFromDatabase(scope);
+
+  if (chunks.length === 0) {
+    return [];
+  }
+
+  const queryEmbedding = await generateEmbedding(query);
+
+  const scoredChunks = chunks.map(chunk => ({
+    chunkId: chunk.chunkId,
+    documentId: chunk.documentId,
+    documentTitle: chunk.documentTitle,
+    score: cosineSimilarity(queryEmbedding, chunk.embedding),
+    text: chunk.text,
+    metadata: chunk.metadata
+  }));
+
+  return scoredChunks
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 }

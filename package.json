@@ -1,6 +1,5 @@
 {
-    "name": "wiseia-v2-backend"
-,
+    "name": "wiseia-v2-backend",
     "version": "0.1.0",
     "private": true,
     "type": "module",
@@ -12,21 +11,25 @@
     },
     "dependencies": {
         "@fastify/cors": "^8.5.0",
+        "@fastify/jwt": "^7.2.4",
         "@fastify/multipart": "^8.3.1",
-        "@fastify/rate-limit": "^8.0.0",
+        "@fastify/rate-limit": "^8.1.1",
         "@fastify/sensible": "^5.6.0",
         "@google/generative-ai": "^0.24.1",
+        "axios": "^1.13.2",
         "bcryptjs": "^2.4.3",
         "csv-parser": "^3.2.0",
-        "dotenv": "^16.4.5",
+        "dotenv": "^16.6.1",
         "fastify": "^4.28.1",
         "fastify-plugin": "^4.5.1",
         "jsonwebtoken": "^9.0.2",
         "knex": "^3.1.0",
         "mammoth": "^1.11.0",
         "mime-types": "^2.1.35",
-        "mssql": "^10.0.2",
-        "openai": "^6.7.0",
+        "mssql": "^10.0.4",
+        "openai": "^6.10.0",
+        "pdf-parse": "^2.4.5",
+        "pdfjs-dist": "^5.4.449",
         "ssh2-sftp-client": "^10.0.3",
         "xlsx": "^0.18.5",
         "zod": "^3.23.8"
@@ -35,9 +38,12 @@
         "@types/bcryptjs": "^2.4.2",
         "@types/jsonwebtoken": "^9.0.6",
         "@types/mime-types": "^3.0.1",
+        "@types/mssql": "^9.1.8",
         "@types/node": "^20.14.12",
+        "@types/pdf-parse": "^1.1.5",
+        "ts-node": "^10.9.2",
         "ts-node-dev": "^2.0.0",
-        "tsx": "^4.20.5",
+        "tsx": "^4.21.0",
         "typescript": "^5.5.4"
     }
 }

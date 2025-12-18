@@ -1,6 +1,7 @@
 // src/routes/departamentos.ts
 import { FastifyPluginAsync } from "fastify";
-import { db } from "../db.js";
+// FIXME: This project uses mssql with getPool(), not Knex db
+// import { db } from "../db.js";
 import { sftpStorage } from "../storage/sftp.js";
 import { requirePerm } from "../auth/requirePerm.js";
 
